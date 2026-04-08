@@ -16,11 +16,11 @@ Use this skill whenever the user wants to:
 
 ## Required workflow (always)
 1. **Synthesize content first** into a canonical markdown draft.
-2. **Classify path/tags** using `mcp_mdidx_synth_classify_path`.
-3. **Persist note** using `mcp_mdidx_synth_note_upsert`.
+2. **Persist note** using `mcp_mdidx_synth_note_upsert` with AI pathing.
+3. **Optionally classify-only** with `mcp_mdidx_synth_classify_path` when you need a dry-run path/tag suggestion before writing.
 4. **Report result** with operation type + final path + indexing status.
 
-Do not skip classification unless user explicitly asks for fixed-path persistence.
+Use `synth_note_upsert` as the primary path for end-to-end classify+persist.
 
 ## Canonical note structure
 Produce markdown body with these sections (as applicable):

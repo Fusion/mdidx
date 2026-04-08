@@ -11,6 +11,10 @@ Highlights:
 
 Current build target: macOS only.
 
+## Example Agentic Pipeline
+
+![Agentic Pipeline](assets/hermes_pipeline.png)
+
 ## Usage
 
 Most defaults are sane — you usually don’t need a long command. See the **Tutorial** section below for the recommended, minimal workflows.
