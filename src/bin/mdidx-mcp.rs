@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use mdidx::mcp::{add_tool_usage_hints, build_config};
+use clap::{Parser, ValueEnum};
+use mdidx::mcp::{add_tool_usage_hints, build_config, init_mcp_logger, set_mcp_log_level};
 use model_context_protocol::protocol::{
     error_codes, JsonRpcId, JsonRpcMessage, JsonRpcResponse, LoggingLevel, SetLevelParams,
     ServerOutbound,
@@ -9,6 +10,41 @@ use model_context_protocol::protocol::{
 use model_context_protocol::server::{McpServer, ServerError, ServerStatus};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
+
+#[derive(Parser)]
+#[command(author, version, about = "mdidx MCP stdio server")]
+struct Args {
+    #[arg(long, value_enum, default_value_t = LogLevelArg::Info)]
+    log_level: LogLevelArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "kebab_case")]
+enum LogLevelArg {
+    Error,
+    Warning,
+    Notice,
+    Info,
+    Debug,
+    Critical,
+    Alert,
+    Emergency,
+}
+
+impl From<LogLevelArg> for LoggingLevel {
+    fn from(value: LogLevelArg) -> Self {
+        match value {
+            LogLevelArg::Error => LoggingLevel::Error,
+            LogLevelArg::Warning => LoggingLevel::Warning,
+            LogLevelArg::Notice => LoggingLevel::Notice,
+            LogLevelArg::Info => LoggingLevel::Info,
+            LogLevelArg::Debug => LoggingLevel::Debug,
+            LogLevelArg::Critical => LoggingLevel::Critical,
+            LogLevelArg::Alert => LoggingLevel::Alert,
+            LogLevelArg::Emergency => LoggingLevel::Emergency,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,8 +54,12 @@ async fn main() -> Result<()> {
     Why: stdio is the most compatible transport for local MCP clients.
     How: intercept logging/setLevel and tools/list locally for low latency, forward all other traffic to the MCP server.
     */
+    let args = Args::parse();
+    let initial_level: LoggingLevel = args.log_level.into();
+    let _ = init_mcp_logger();
+    let _ = set_mcp_log_level(initial_level.clone());
     let (server, mut channels) = McpServer::new(build_config());
-    let log_level = Arc::new(RwLock::new(LoggingLevel::Info));
+    let log_level = Arc::new(RwLock::new(initial_level));
 
     let stdout_handle = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -144,8 +184,10 @@ async fn handle_set_level(
         }
     };
 
+    let level = params.level.clone();
     let mut guard = log_level.write().await;
-    *guard = params.level;
+    *guard = level.clone();
+    let _ = set_mcp_log_level(level);
 
     JsonRpcResponse::success(request.id.clone(), serde_json::json!({}))
 }

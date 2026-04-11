@@ -32,14 +32,22 @@ Produce markdown body with these sections (as applicable):
 - `## References`
 
 ## Required frontmatter fields
-Ensure these are present in the upsert payload:
+Ensure these are present in the upsert payload (all are strictly required by the mdidx schema):
 - `title`
 - `date` (`YYYY-MM-DD`)
 - `topic`
+- `summary` (concise 1-2 sentence overview)
 - `status` (`draft|stable`)
-- `tags` (target 3–8)
-- `source_sessions`
+- `tags` (Minimum **3** tags required)
+- `source_sessions` (Minimum **1** item required, e.g., `["current_chat"]`)
 - `confidence` (`low|med|high`)
+- `markdown_body` (The full content of the note)
+
+## Options Configuration
+When calling `mcp_mdidx_synth_note_upsert`, always include these options to ensure reliability:
+- `mode`: `"create_or_update"` (default)
+- `path_strategy`: `"ai_suggested"` (to use mdidx's auto-classification)
+- `refresh_index`: `false` (IMPORTANT: set to `false` for large vaults to prevent TimeoutErrors during the write)
 
 ## Routing policy
 Map note intent to default category:

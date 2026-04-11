@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::Result;
-use clap::Parser;
-use mdidx::mcp::{add_tool_usage_hints, build_config_with_capabilities};
+use clap::{Parser, ValueEnum};
+use mdidx::mcp::{add_tool_usage_hints, build_config_with_capabilities, init_mcp_logger, set_mcp_log_level};
 use model_context_protocol::protocol::{
     self, error_codes, ClientInbound, JsonRpcId, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     LoggingLevel, SetLevelParams,
@@ -30,6 +30,36 @@ struct Args {
     port: u16,
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+    #[arg(long, value_enum, default_value_t = LogLevelArg::Info)]
+    log_level: LogLevelArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "kebab_case")]
+enum LogLevelArg {
+    Error,
+    Warning,
+    Notice,
+    Info,
+    Debug,
+    Critical,
+    Alert,
+    Emergency,
+}
+
+impl From<LogLevelArg> for LoggingLevel {
+    fn from(value: LogLevelArg) -> Self {
+        match value {
+            LogLevelArg::Error => LoggingLevel::Error,
+            LogLevelArg::Warning => LoggingLevel::Warning,
+            LogLevelArg::Notice => LoggingLevel::Notice,
+            LogLevelArg::Info => LoggingLevel::Info,
+            LogLevelArg::Debug => LoggingLevel::Debug,
+            LogLevelArg::Critical => LoggingLevel::Critical,
+            LogLevelArg::Alert => LoggingLevel::Alert,
+            LogLevelArg::Emergency => LoggingLevel::Emergency,
+        }
+    }
 }
 
 struct AppState {
@@ -49,6 +79,9 @@ async fn main() -> Result<()> {
     How: validate protocol headers, parse JSON-RPC (single or batch), and route to the MCP server.
     */
     let args = Args::parse();
+    let initial_level: LoggingLevel = args.log_level.into();
+    let _ = init_mcp_logger();
+    let _ = set_mcp_log_level(initial_level.clone());
     let (config, capabilities) = build_config_with_capabilities();
     let (server, mut channels) = McpServer::new(config);
 
@@ -70,7 +103,7 @@ async fn main() -> Result<()> {
         server,
         inbound_tx: channels.inbound_tx.clone(),
         endpoint: args.endpoint.clone(),
-        log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
+        log_level: Arc::new(RwLock::new(initial_level)),
         capabilities,
     });
     let endpoint = args.endpoint.clone();
@@ -391,8 +424,10 @@ async fn handle_set_level(
         }
     };
 
+    let level = params.level.clone();
     let mut guard = log_level.write().await;
-    *guard = params.level;
+    *guard = level.clone();
+    let _ = set_mcp_log_level(level);
 
     JsonRpcResponse::success(request.id, serde_json::json!({}))
 }

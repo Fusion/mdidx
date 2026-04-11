@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, Utc};
 use model_context_protocol::macros::mcp_tool;
-use model_context_protocol::protocol::{McpCapabilities, McpToolDefinition};
+use model_context_protocol::protocol::{LoggingLevel, McpCapabilities, McpToolDefinition};
 use model_context_protocol::{McpServerConfig, tools};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -23,6 +27,98 @@ use crate::{
     get_vault_path, index_single_file, load_ai_config, load_index_config, search, search_fts,
     search_hybrid, stats,
 };
+
+static MCP_LOGGER: OnceLock<FileLogger> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum LogSeverity {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+}
+
+struct FileLogger {
+    path: PathBuf,
+    level: AtomicU8,
+    lock: Mutex<()>,
+}
+
+impl FileLogger {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            level: AtomicU8::new(LogSeverity::Info as u8),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn set_level(&self, level: LoggingLevel) {
+        let severity = log_severity(level);
+        self.level.store(severity as u8, Ordering::Relaxed);
+    }
+
+    fn enabled(&self, level: LogSeverity) -> bool {
+        level as u8 <= self.level.load(Ordering::Relaxed)
+    }
+
+    fn log(&self, level: LogSeverity, message: &str) {
+        if !self.enabled(level) {
+            return;
+        }
+        let _guard = self.lock.lock();
+        let timestamp = Utc::now().to_rfc3339();
+        let level_label = match level {
+            LogSeverity::Error => "ERROR",
+            LogSeverity::Warn => "WARN",
+            LogSeverity::Info => "INFO",
+            LogSeverity::Debug => "DEBUG",
+        };
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = writeln!(file, "{timestamp} [{level_label}] {message}");
+        }
+    }
+}
+
+fn log_severity(level: LoggingLevel) -> LogSeverity {
+    match level {
+        LoggingLevel::Error => LogSeverity::Error,
+        LoggingLevel::Warning => LogSeverity::Warn,
+        LoggingLevel::Info => LogSeverity::Info,
+        LoggingLevel::Notice => LogSeverity::Info,
+        LoggingLevel::Critical => LogSeverity::Error,
+        LoggingLevel::Alert => LogSeverity::Error,
+        LoggingLevel::Emergency => LogSeverity::Error,
+        LoggingLevel::Debug => LogSeverity::Debug,
+    }
+}
+
+pub fn init_mcp_logger() -> Result<PathBuf> {
+    let path = app_data_dir()?.join("mcp.log");
+    if MCP_LOGGER.get().is_none() {
+        let _ = MCP_LOGGER.set(FileLogger::new(path.clone()));
+    }
+    Ok(path)
+}
+
+pub fn set_mcp_log_level(level: LoggingLevel) -> Result<()> {
+    let _ = init_mcp_logger()?;
+    if let Some(logger) = MCP_LOGGER.get() {
+        logger.set_level(level);
+    }
+    Ok(())
+}
+
+fn log_mcp(level: LoggingLevel, message: impl AsRef<str>) {
+    if MCP_LOGGER.get().is_none() {
+        if init_mcp_logger().is_err() {
+            return;
+        }
+    }
+    if let Some(logger) = MCP_LOGGER.get() {
+        logger.log(log_severity(level), message.as_ref());
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 #[mcp_tool("Semantic vector search over indexed markdown chunks (uses embeddings; returns nearest chunks)")]
@@ -43,6 +139,17 @@ async fn search_chunks(
         Some(path) => PathBuf::from(path),
         None => default_db_path().map_err(|err| err.to_string())?,
     };
+    log_mcp(
+        LoggingLevel::Info,
+        format!(
+            "search_chunks start db={} limit={} filter={:?} postfilter={} max_content_chars={}",
+            db_path.display(),
+            limit.unwrap_or(5),
+            filter.as_deref(),
+            postfilter.unwrap_or(false),
+            max_content_chars.unwrap_or(200)
+        ),
+    );
     let config = match load_index_config(&db_path).map_err(|err| err.to_string())? {
         Some(existing) => existing,
         None => {
@@ -67,6 +174,13 @@ async fn search_chunks(
             }
         }
     };
+    log_mcp(
+        LoggingLevel::Debug,
+        format!(
+            "search_chunks config provider={:?} model={:?} openai_model={:?} dim={}",
+            config.provider, config.model, config.openai_model, config.dim
+        ),
+    );
     let params = SearchParams {
         query,
         db: db_path,
@@ -81,7 +195,22 @@ async fn search_chunks(
         max_content_chars: max_content_chars.unwrap_or(200),
     };
 
-    search(params).await.map_err(|err| err.to_string())
+    match search(params).await {
+        Ok(results) => {
+            log_mcp(
+                LoggingLevel::Info,
+                format!("search_chunks ok results={}", results.results.len()),
+            );
+            Ok(results)
+        }
+        Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("search_chunks failed error={}", err),
+            );
+            Err(err.to_string())
+        }
+    }
 }
 
 #[mcp_tool("Lexical BM25 search over indexed chunks (requires FTS index; returns _score)")]
@@ -96,6 +225,16 @@ async fn search_chunks_bm25(
         Some(path) => PathBuf::from(path),
         None => default_db_path().map_err(|err| err.to_string())?,
     };
+    log_mcp(
+        LoggingLevel::Info,
+        format!(
+            "search_chunks_bm25 start db={} limit={} filter={:?} max_content_chars={}",
+            db_path.display(),
+            limit.unwrap_or(5),
+            filter.as_deref(),
+            max_content_chars.unwrap_or(200)
+        ),
+    );
     let params = FtsSearchParams {
         query,
         db: db_path,
@@ -104,7 +243,22 @@ async fn search_chunks_bm25(
         max_content_chars: max_content_chars.unwrap_or(200),
     };
 
-    search_fts(params).await.map_err(|err| err.to_string())
+    match search_fts(params).await {
+        Ok(results) => {
+            log_mcp(
+                LoggingLevel::Info,
+                format!("search_chunks_bm25 ok results={}", results.results.len()),
+            );
+            Ok(results)
+        }
+        Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("search_chunks_bm25 failed error={}", err),
+            );
+            Err(err.to_string())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -126,6 +280,17 @@ async fn search_chunks_hybrid(
         Some(path) => PathBuf::from(path),
         None => default_db_path().map_err(|err| err.to_string())?,
     };
+    log_mcp(
+        LoggingLevel::Info,
+        format!(
+            "search_chunks_hybrid start db={} limit={} filter={:?} postfilter={} max_content_chars={}",
+            db_path.display(),
+            limit.unwrap_or(5),
+            filter.as_deref(),
+            postfilter.unwrap_or(false),
+            max_content_chars.unwrap_or(200)
+        ),
+    );
     let config = match load_index_config(&db_path).map_err(|err| err.to_string())? {
         Some(existing) => existing,
         None => {
@@ -150,6 +315,13 @@ async fn search_chunks_hybrid(
             }
         }
     };
+    log_mcp(
+        LoggingLevel::Debug,
+        format!(
+            "search_chunks_hybrid config provider={:?} model={:?} openai_model={:?} dim={}",
+            config.provider, config.model, config.openai_model, config.dim
+        ),
+    );
     let params = HybridSearchParams {
         query,
         db: db_path,
@@ -164,7 +336,22 @@ async fn search_chunks_hybrid(
         max_content_chars: max_content_chars.unwrap_or(200),
     };
 
-    search_hybrid(params).await.map_err(|err| err.to_string())
+    match search_hybrid(params).await {
+        Ok(results) => {
+            log_mcp(
+                LoggingLevel::Info,
+                format!("search_chunks_hybrid ok results={}", results.results.len()),
+            );
+            Ok(results)
+        }
+        Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("search_chunks_hybrid failed error={}", err),
+            );
+            Err(err.to_string())
+        }
+    }
 }
 
 #[mcp_tool("Get index stats (counts, last indexed time)")]
@@ -249,6 +436,20 @@ async fn synth_note_upsert(
             ));
         }
     };
+    log_mcp(
+        LoggingLevel::Info,
+        format!(
+            "synth_note_upsert start vault_id={} vault_path={} path_strategy={} upsert_mode={} refresh_index={} conflict_policy={} index_scope={} dry_run={}",
+            vault_id,
+            vault_path.display(),
+            path_strategy_label(&options.path_strategy),
+            upsert_mode_label(&options.upsert_key.mode),
+            options.refresh_index,
+            conflict_policy_label(&options.conflict_policy),
+            index_scope_label(&options.index_scope),
+            options.dry_run
+        ),
+    );
 
     let payload_hash = hash_payload(&note, &classification, &options, idempotency_key.as_deref());
     if let Some(key) = idempotency_key.as_ref() {
@@ -256,6 +457,10 @@ async fn synth_note_upsert(
             Ok(Some(entry)) => {
                 if entry.payload_hash == payload_hash {
                     if let Ok(resp) = serde_json::from_value::<SynthNoteUpsertResponse>(entry.response) {
+                        log_mcp(
+                            LoggingLevel::Info,
+                            format!("synth_note_upsert idempotent hit vault_id={} key={}", vault_id, key),
+                        );
                         return Ok(resp);
                     }
                     warnings.push("idempotency cache invalid; recomputing response".to_string());
@@ -276,9 +481,22 @@ async fn synth_note_upsert(
     }
 
     let resolved_classification = resolve_classification(&note, classification, &options, &mut warnings).await;
+    if let Some(ref classification) = resolved_classification {
+        log_mcp(
+            LoggingLevel::Debug,
+            format!(
+                "synth_note_upsert classification vault_id={} category={} domain={:?} subpath={:?}",
+                vault_id, classification.category, classification.domain, classification.subpath
+            ),
+        );
+    }
     let target_dir = match build_target_dir(&vault_path, &note, &resolved_classification, &options) {
         Ok(value) => value,
         Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("synth_note_upsert build_target_dir failed vault_id={} error={}", vault_id, err),
+            );
             return Ok(SynthNoteUpsertResponse::error(
                 vault_id,
                 options.index_scope.clone(),
@@ -291,6 +509,10 @@ async fn synth_note_upsert(
     let slug = match build_slug(&note, options.slug_override.as_deref()) {
         Ok(value) => value,
         Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("synth_note_upsert build_slug failed vault_id={} error={}", vault_id, err),
+            );
             return Ok(SynthNoteUpsertResponse::error(
                 vault_id,
                 options.index_scope.clone(),
@@ -301,10 +523,23 @@ async fn synth_note_upsert(
     };
     let filename = build_filename(&note, &slug, &options.filename_strategy);
     let target_path = target_dir.join(filename);
+    log_mcp(
+        LoggingLevel::Debug,
+        format!(
+            "synth_note_upsert target_dir={} slug={} target_path={}",
+            target_dir.display(),
+            slug,
+            target_path.display()
+        ),
+    );
 
     let existing_path = match find_existing_path(&vault_path, &note, &options) {
         Ok(path) => path,
         Err(err) => {
+            log_mcp(
+                LoggingLevel::Error,
+                format!("synth_note_upsert find_existing_path failed vault_id={} error={}", vault_id, err),
+            );
             return Ok(SynthNoteUpsertResponse::error(
                 vault_id,
                 options.index_scope.clone(),
@@ -326,6 +561,15 @@ async fn synth_note_upsert(
         final_path = append_version_path(&final_path);
         operation = "created";
     }
+    log_mcp(
+        LoggingLevel::Info,
+        format!(
+            "synth_note_upsert write_decision operation={} final_path={} existed_before={}",
+            operation,
+            final_path.display(),
+            final_path.exists()
+        ),
+    );
 
     let existing_frontmatter = if final_path.exists() {
         read_frontmatter(&final_path).unwrap_or_default()
@@ -345,13 +589,32 @@ async fn synth_note_upsert(
             operation = "noop";
         }
     }
+    if operation == "noop" {
+        log_mcp(
+            LoggingLevel::Info,
+            format!("synth_note_upsert noop vault_id={} path={}", vault_id, final_path.display()),
+        );
+    }
 
     if options.dry_run {
         warnings.push("dry_run enabled: no file written".to_string());
+        log_mcp(
+            LoggingLevel::Info,
+            format!("synth_note_upsert dry_run vault_id={} path={}", vault_id, final_path.display()),
+        );
     } else if operation != "noop" {
         if let Some(parent) = final_path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
+            log_mcp(
+                LoggingLevel::Error,
+                format!(
+                    "synth_note_upsert create_dir failed vault_id={} path={} error={}",
+                    vault_id,
+                    parent.display(),
+                    err
+                ),
+            );
             return Ok(SynthNoteUpsertResponse::error(
                 vault_id,
                 options.index_scope.clone(),
@@ -360,6 +623,15 @@ async fn synth_note_upsert(
             ));
         }
         if let Err(err) = fs::write(&final_path, canonical_markdown) {
+            log_mcp(
+                LoggingLevel::Error,
+                format!(
+                    "synth_note_upsert write failed vault_id={} path={} error={}",
+                    vault_id,
+                    final_path.display(),
+                    err
+                ),
+            );
             return Ok(SynthNoteUpsertResponse::error(
                 vault_id,
                 options.index_scope.clone(),
@@ -367,19 +639,41 @@ async fn synth_note_upsert(
                 format!("write failed: {err}"),
             ));
         }
+        log_mcp(
+            LoggingLevel::Info,
+            format!("synth_note_upsert write ok vault_id={} path={}", vault_id, final_path.display()),
+        );
     }
 
     let index_result = if options.refresh_index {
+        log_mcp(
+            LoggingLevel::Info,
+            format!(
+                "synth_note_upsert index refresh start vault_id={} scope={}",
+                vault_id,
+                index_scope_label(&options.index_scope)
+            ),
+        );
         match run_index_refresh(&final_path, &vault_path, options.index_scope.clone()).await {
-            Ok(stats) => IndexResult {
-                requested: true,
-                executed: true,
-                scope: options.index_scope.clone(),
-                indexed_at: Some(Utc::now().to_rfc3339()),
-                stats: stats.map(|value| serde_json::json!(value)),
-            },
+            Ok(stats) => {
+                log_mcp(
+                    LoggingLevel::Info,
+                    format!("synth_note_upsert index refresh ok vault_id={} path={}", vault_id, final_path.display()),
+                );
+                IndexResult {
+                    requested: true,
+                    executed: true,
+                    scope: options.index_scope.clone(),
+                    indexed_at: Some(Utc::now().to_rfc3339()),
+                    stats: stats.map(|value| serde_json::json!(value)),
+                }
+            }
             Err(err) => {
                 warnings.push(format!("index refresh failed: {err}"));
+                log_mcp(
+                    LoggingLevel::Error,
+                    format!("synth_note_upsert index refresh failed vault_id={} error={}", vault_id, err),
+                );
                 IndexResult {
                     requested: true,
                     executed: false,
@@ -586,7 +880,7 @@ fn tool_usage_hints() -> std::collections::HashMap<&'static str, &'static str> {
     );
     hints.insert(
         "synth_note_upsert",
-        "Write/update a synthesized note into a configured vault with strict frontmatter, optional indexing, and idempotency.",
+        "Write/update a synthesized note into a configured vault with strict frontmatter, optional indexing, and idempotency. Required options: path_strategy (ai_suggested|fixed_path|inbox), refresh_index. upsert_key.mode defaults to hash; if frontmatter_key then provide frontmatter_key_name/value; if path then provide upsert_key.path.",
     );
     hints.insert(
         "synth_classify_path",
@@ -794,6 +1088,7 @@ struct SynthUpsertOptions {
     #[serde(default = "default_filename_strategy")]
     filename_strategy: FilenameStrategy,
     slug_override: Option<String>,
+    #[serde(default)]
     upsert_key: UpsertKey,
     #[serde(default = "default_conflict_policy")]
     conflict_policy: ConflictPolicy,
@@ -806,6 +1101,7 @@ struct SynthUpsertOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpsertKey {
+    #[serde(default = "default_upsert_mode")]
     mode: UpsertMode,
     frontmatter_key_name: Option<String>,
     frontmatter_key_value: Option<String>,
@@ -864,6 +1160,21 @@ fn default_index_scope() -> IndexScope {
     IndexScope::VaultDelta
 }
 
+fn default_upsert_mode() -> UpsertMode {
+    UpsertMode::Hash
+}
+
+impl Default for UpsertKey {
+    fn default() -> Self {
+        Self {
+            mode: default_upsert_mode(),
+            frontmatter_key_name: None,
+            frontmatter_key_value: None,
+            path: None,
+        }
+    }
+}
+
 fn default_max_tags() -> usize {
     8
 }
@@ -890,6 +1201,38 @@ fn default_alternatives_limit() -> usize {
 
 fn default_include_rationale() -> bool {
     true
+}
+
+fn path_strategy_label(value: &PathStrategy) -> &'static str {
+    match value {
+        PathStrategy::AiSuggested => "ai_suggested",
+        PathStrategy::FixedPath => "fixed_path",
+        PathStrategy::Inbox => "inbox",
+    }
+}
+
+fn upsert_mode_label(value: &UpsertMode) -> &'static str {
+    match value {
+        UpsertMode::Hash => "hash",
+        UpsertMode::FrontmatterKey => "frontmatter_key",
+        UpsertMode::Path => "path",
+    }
+}
+
+fn conflict_policy_label(value: &ConflictPolicy) -> &'static str {
+    match value {
+        ConflictPolicy::Replace => "replace",
+        ConflictPolicy::AppendVersion => "append_version",
+        ConflictPolicy::MergeFrontmatter => "merge_frontmatter",
+    }
+}
+
+fn index_scope_label(value: &IndexScope) -> &'static str {
+    match value {
+        IndexScope::ChangedFileOnly => "changed_file_only",
+        IndexScope::VaultDelta => "vault_delta",
+        IndexScope::FullVault => "full_vault",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
