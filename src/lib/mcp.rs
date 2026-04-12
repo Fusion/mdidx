@@ -25,7 +25,7 @@ use crate::{
     IndexSingleFileParams, IndexSingleFileResult, OpenAIModelChoice, SearchParams, SearchResults,
     StatsParams, StatsResults, app_data_dir, default_db_path, get_file_content as read_file_content,
     get_vault_path, index_single_file, load_ai_config, load_index_config, search, search_fts,
-    search_hybrid, stats,
+    search_hybrid, stats, MDIDX_VERSION,
 };
 
 static MCP_LOGGER: OnceLock<FileLogger> = OnceLock::new();
@@ -365,6 +365,14 @@ async fn stats_index(
     let params = StatsParams { db: db_path };
 
     stats(params).await.map_err(|err| err.to_string())
+}
+
+#[mcp_tool("Get mdidx version information")]
+async fn version() -> Result<VersionInfo, String> {
+    Ok(VersionInfo {
+        name: "mdidx",
+        version: MDIDX_VERSION,
+    })
 }
 
 #[mcp_tool("Read file content from disk (use after search tools to fetch full context)")]
@@ -815,6 +823,7 @@ pub fn build_config_with_capabilities() -> (McpServerConfig, McpCapabilities) {
             SearchChunksBm25Tool,
             SearchChunksHybridTool,
             StatsIndexTool,
+            VersionTool,
             GetFileContentTool,
             SynthNoteUpsertTool,
             SynthClassifyPathTool
@@ -877,6 +886,10 @@ fn tool_usage_hints() -> std::collections::HashMap<&'static str, &'static str> {
     hints.insert(
         "get_file_content",
         "Read full file text from disk after search results. Use start_line/max_lines for targeted context.",
+    );
+    hints.insert(
+        "version",
+        "Return the mdidx build version baked into the binary.",
     );
     hints.insert(
         "synth_note_upsert",
@@ -1327,6 +1340,12 @@ struct SynthClassifyResponse {
     rationale: Option<Vec<String>>,
     warnings: Vec<String>,
     error: Option<ErrorDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VersionInfo {
+    name: &'static str,
+    version: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

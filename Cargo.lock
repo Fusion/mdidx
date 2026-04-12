@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "mdidx"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "actix-web",
  "anyhow",

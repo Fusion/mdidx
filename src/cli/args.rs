@@ -22,6 +22,7 @@ pub enum Command {
     FtsRefresh(FtsArgs),
     Search(SearchArgs),
     Stats(StatsArgs),
+    Version,
     Vault(VaultArgs),
     Config(ConfigArgs),
 }

@@ -3,7 +3,7 @@ use mdidx::{
     AiConfig, FtsSearchParams, FtsSearchResults, HybridSearchParams, HybridSearchResults,
     IndexConfig, SearchParams, SearchResult, SearchResults, load_ai_config, load_index_config,
     load_vault_config, search, search_fts, search_hybrid, set_classify_model, set_vault_path,
-    stats, format_epoch_seconds, StatsParams, VaultConfig,
+    stats, format_epoch_seconds, StatsParams, VaultConfig, MDIDX_VERSION,
 };
 
 use super::args::{
@@ -128,6 +128,11 @@ pub async fn config_command(args: ConfigArgs) -> Result<()> {
         ConfigCommand::Set(args) => config_set_command(args).await,
         ConfigCommand::Show => config_show_command().await,
     }
+}
+
+pub fn version_command() -> Result<()> {
+    println!("{MDIDX_VERSION}");
+    Ok(())
 }
 
 async fn config_set_command(args: ConfigSetArgs) -> Result<()> {

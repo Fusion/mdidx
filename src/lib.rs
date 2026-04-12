@@ -39,3 +39,5 @@ pub use search::{
 };
 pub use stats::{StatsParams, StatsResults, format_epoch_seconds, stats};
 pub use vaults::{VaultConfig, get_vault_path, load_vault_config, save_vault_config, set_vault_path};
+
+pub const MDIDX_VERSION: &str = env!("CARGO_PKG_VERSION");

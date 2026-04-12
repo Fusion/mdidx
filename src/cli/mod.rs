@@ -20,6 +20,7 @@ pub async fn run() -> Result<()> {
         Command::FtsRefresh(args) => fts::fts_refresh_command(args).await,
         Command::Search(args) => commands::search_command(args).await,
         Command::Stats(args) => commands::stats_command(args).await,
+        Command::Version => commands::version_command(),
         Command::Vault(args) => commands::vault_command(args).await,
         Command::Config(args) => commands::config_command(args).await,
     }
